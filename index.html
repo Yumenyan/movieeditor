@@ -2376,6 +2376,7 @@ function fixTemplate(t) {
   t.durations = Object.assign({ ...DUR_BASE }, t.durations);
   t.theme = Object.assign(clone(THEME_BASE), t.theme);
   t.stats = (t.stats || []).map(s => Object.assign({ id: uid(), label: '項目', col: '', expr: '', display: '', unit: '', prefix: '', better: 'high', decimals: 0, comma: true, hint: '' }, s));
+  t.rules = Object.assign({ winPts: 1, drawPts: 1, tol: 0 }, t.rules);
   t.scoring = t.scoring || 'winner'; t.roundTitle = t.roundTitle ?? 'ROUND {n}';
   t.view = Object.assign({ values: false, score: false, hint: false, sub: true }, t.view);
   t.motion = Object.assign({ preset: 'hard' }, t.motion); if (t.motion.preset !== 'custom') applyMotionPreset(t.motion, t.motion.preset in MOTION_PRESETS ? t.motion.preset : 'hard');
@@ -2448,12 +2449,14 @@ function roundResult(scene) {
   const st = statById(scene.props.statId);
   const ov = scene.props.overrides || {};
   const values = P.players.map(p => { const o = ov[p.id]; return (o !== undefined && o !== '') ? num(o) : (st ? statValue(st, p.row) : NaN); });
-  const pts = values.map(() => 0); const winners = new Set(); const ranks = values.map(() => 0);
+  const pts = values.map(() => 0); const winners = new Set(); const ranks = values.map(() => 0); let draw = false;
+  const wt = +scene.props.weight || 1, RU = () => P.template.rules;
   if (!st) return { st, values, pts, winners, ranks };
   if (st.better === 'manual') {
     const wi = P.players.findIndex(p => p.id === scene.props.judge);
-    if (wi >= 0) { winners.add(wi); pts[wi] = 1; ranks.fill(2); ranks[wi] = 1; }
-    return { st, values, pts, winners, ranks };
+    if (wi >= 0) { winners.add(wi); pts[wi] = RU().winPts * wt; ranks.fill(2); ranks[wi] = 1; }
+    else pts.fill(RU().drawPts * wt);
+    return { st, values, pts, winners, ranks, draw: wi < 0 };
   }
   const hi = st.better !== 'low';
   const valid = values.map((v, i) => [v, i]).filter(([v]) => isFinite(v));
@@ -2461,12 +2464,15 @@ function roundResult(scene) {
   valid.forEach(([v, i]) => { ranks[i] = 1 + valid.filter(([w]) => hi ? w > v : w < v).length; });
   if (valid.length) {
     const best = valid[0][0];
-    valid.forEach(([v, i]) => { if (v === best) winners.add(i); });
-    if (P.template.scoring === 'rank') valid.forEach(([v, i]) => pts[i] = valid.filter(([w]) => hi ? w < v : w > v).length);
-    else if (winners.size < P.players.length) winners.forEach(i => pts[i] = 1);
+    const tol = Math.abs(best) * (+RU().tol || 0) / 100;
+    valid.forEach(([v, i]) => { if (Math.abs(v - best) <= tol + 1e-12) winners.add(i); });
+    if (P.template.scoring === 'rank') valid.forEach(([v, i]) => pts[i] = valid.filter(([w]) => hi ? w < v : w > v).length * wt);
+    else if (winners.size === 1) winners.forEach(i => pts[i] = RU().winPts * wt);
+    else winners.forEach(i => pts[i] = RU().drawPts * wt);   // 同率（引き分け）
     if (winners.size === P.players.length) winners.clear();   // 全員同値は引き分け
+    draw = winners.size !== 1 && valid.length > 0;
   }
-  return { st, values, pts, winners, ranks };
+  return { st, values, pts, winners, ranks, draw };
 }
 function scoresBefore(index) {
   const sc = P.players.map(() => 0);
@@ -2910,6 +2916,7 @@ registerSceneType('round', {
     { key: 'statId', label: '比較項目', type: 'stat' },
     { key: 'title', label: '見出し（空欄で項目名）', type: 'text' },
     { key: 'revealAt', label: '勝者発表の秒数（0で自動）', type: 'number', step: .05 },
+    { key: 'weight', label: 'このラウンドの得点倍率（空欄=1）', type: 'number', step: .5 },
     { key: 'overrides', label: '値の上書き（空欄でデータ値）', type: 'overrides' },
   ],
   reveal: s => s.props.revealAt > 0 ? Math.min(s.props.revealAt, s.dur - .05) : clamp(s.dur * .48, .3, Math.max(.3, s.dur - .3)),
@@ -2917,7 +2924,7 @@ registerSceneType('round', {
   draw(ctx, S) {
     const { t, L, W, H, k, scene, T, M } = S, res = roundResult(scene), st = res.st, rv = SceneTypes.round.reveal(scene), mo = M.motion;
     const before = scoresBefore(S.index), rn = roundNumber(S.index), rTotal = P.scenes.filter(s => s.type === 'round').length, side = rn % 2 ? 1 : -1;
-    const wi = [...res.winners][0], wr = res.winners.size === 1 ? L.rects[wi] : null, isDraw = t >= rv && !res.winners.size;
+    const wi = [...res.winners][0], wr = res.winners.size === 1 ? L.rects[wi] : null, isDraw = t >= rv && res.winners.size !== 1;
     const vp = L.rects.length > 1 ? vsPoint(L, 0) : [W / 2, H / 2], wc = wr ? cardCenter(wr) : vp;
     // 勝者側へ境界線が押し込まれる
     const push = t >= rv && wr ? E.outBack(prog(t, rv, rv + .25)) * (wi === 0 ? 1 : -1) * .12 * mo : 0;
@@ -3244,23 +3251,30 @@ EDIT.intro = (ctx, S) => {
   if (!n) glowText(ctx, S, '「出場者」タブで出場者を追加', W / 2, H / 2, { size: 46 * k });
 };
 /* ---- ラウンド: 分割に項目名 → 勝者を全画面で ---- */
+function players_draw(ctx, S, rv) {   // 引き分け: 両者の名前を各帯に出す
+  const bs = bands(S, Math.max(1, S.players.length));
+  bs.forEach((b, i) => gText(ctx, S, S.players[i]?.name, b.x + b.w / 2, b.y + b.h * .27, rv + .06 + i * .06, { size: S.W * .075, glow: neon(S, i), glowFill: neon(S, i) }));
+}
 EDIT.round = (ctx, S) => {
   const { t, W, H, k, scene, T } = S, res = roundResult(scene), st = res.st, rv = SceneTypes.round.reveal(scene), sd = S.index * 5 + 2, n = S.players.length;
   const wi = res.winners.size === 1 ? [...res.winners][0] : -1, showWin = t >= rv && wi >= 0;
   S.fx = {}; ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
   ctx.save();
-  if (!showWin) { shotIn(ctx, S, 0, cutKind(sd)); kenBurns(ctx, S, 0, rv); splitShots(ctx, S, 0, rv); }
+  const drawn = t >= rv && wi < 0, b0 = drawn ? rv : 0, b1 = drawn ? scene.dur : rv;
+  if (!showWin) { shotIn(ctx, S, b0, cutKind(drawn ? sd + 2 : sd)); kenBurns(ctx, S, b0, b1); splitShots(ctx, S, b0, b1); }
   else { shotIn(ctx, S, rv, cutKind(sd + 1)); kenBurns(ctx, S, rv, scene.dur); fullShot(ctx, S, wi); }
   ctx.restore();
   vignette(ctx, S, .72);
-  if (!showWin) bokeh(ctx, S, (1 - prog(t, .1, rv)) * .7 * (S.index % 3 === 1 ? 1 : .35), sd);
+  if (!showWin) bokeh(ctx, S, drawn ? .6 : (1 - prog(t, .1, rv)) * .7 * (S.index % 3 === 1 ? 1 : .35), sd);
   embers(ctx, S, 1);
   if (!showWin) shotOut(S, rv, cutKind(sd + 1)); shotOut(S, scene.dur, cutKind(sd + 5));
   finishFX(ctx, S);
   const label = scene.props.title || st?.label || '（項目未設定）';
   if (!showWin) {
-    gText(ctx, S, label, W / 2, H / 2, .02, { size: W * .13 });
-    if (t >= rv && wi < 0 && n) gText(ctx, S, 'DRAW', W / 2, H / 2 + W * .16, rv, { size: W * .1 });
+    if (drawn && n) {
+      players_draw(ctx, S, rv);
+      gText(ctx, S, 'DRAW', W / 2, H / 2, rv + .02, { size: W * .17, glow: '#9fb4d9', glowFill: '#9fb4d9' });
+    } else gText(ctx, S, label, W / 2, H / 2, .02, { size: W * .13 });
   } else {
     gText(ctx, S, S.players[wi].name, W / 2, H / 2, rv + .02, { size: W * .13 });
     if (T.view.values && st && st.better !== 'manual') gText(ctx, S, statText(st, S.players[wi].row, res.values[wi]), W / 2, H / 2 + W * .14, rv + .08, { size: W * .065 });
@@ -4077,6 +4091,11 @@ const TplEditor = {
         <div class="grid2"><label class="f"><span>動画タイトル（イントロ）</span><input data-k="title"></label><label class="f"><span>サブタイトル</span><input data-k="subtitle"></label></div>
         <div class="grid2"><label class="f"><span>ラウンド表記（{n}=番号 {total}=総数）</span><input data-k="roundTitle"></label>
         <label class="f"><span>採点方式</span><select data-k="scoring"><option value="winner">1位に1点</option><option value="rank">順位点（下にいる人数分）</option></select></label></div>
+        <h3>対決ルール</h3>
+        <div class="grid2"><label class="f"><span>勝ちの得点</span><input type="number" step="0.5" min="0" data-k="rules.winPts"></label>
+        <label class="f"><span>引き分けの得点（各自）</span><input type="number" step="0.5" min="0" data-k="rules.drawPts"></label></div>
+        <label class="f"><span>同値とみなす差（％。0=完全一致のみ）</span><input type="number" step="1" min="0" data-k="rules.tol"></label>
+        <p class="hint">引き分けは両者に「引き分けの得点」が入ります（初期値は1点ずつ）。項目ごとの倍率は、ラウンドを選んで「得点倍率」で設定できます。順位点方式の場合は勝ち点・引き分け点は使わず、倍率のみ有効です。</p>
       </div>
       <div><h3>データ</h3>
         <div class="row"><label class="f"><span>シート名</span><input data-k="data.sheet" list="dlSheets"></label><label class="f nf" style="width:70px"><span>見出し行</span><input type="number" min="1" data-k="data.headerRow"></label></div>
